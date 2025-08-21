@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<title>Neon Typestorm</title>
+<style>
+  :root {
+    --ui-bg: rgba(8,10,16,.75);
+    --ui-border: rgba(255,255,255,.08);
+    --ui-text: #eaf2ff;
+    --accent: #7afcff;
+  }
+  html,body { height:100%; margin:0; background:#05060a; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  .hud {
+    position: fixed; left: 16px; right: 16px; top: 16px; z-index: 10;
+    display: grid; grid-template-columns: 1fr auto auto auto; gap: 10px; align-items: center;
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    background: var(--ui-bg); border: 1px solid var(--ui-border); border-radius: 14px; padding: 10px 12px;
+    color: var(--ui-text); font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    box-shadow: 0 10px 30px rgba(0,0,0,.35);
+  }
+  .word {
+    font: 700 24px/1.1 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    letter-spacing: .5px; color: #cfe8ff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .typed   { color: #8cffb7; }
+  .pending { color: #ffffff; opacity: .95; }
+  .wrong   { color: #ff8c8c; }
+  .chip { border:1px solid var(--ui-border); border-radius:12px; padding:8px 12px; background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.03)); }
+  .btn { cursor:pointer; user-select:none; border-radius:12px; padding:8px 12px; border:1px solid var(--ui-border); background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.03)); }
+  .btn:active { transform: translateY(1px); }
+  .bar {
+    height: 10px; border-radius:999px; background: rgba(255,255,255,.08); overflow: hidden; border:1px solid var(--ui-border);
+  }
+  .fill { height:100%; width: 0%; background: linear-gradient(90deg, #7afcff, #c779ff, #ffd47a); transition: width .12s linear; }
+  .footer {
+    position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 10;
+    color:#a7b4c8; font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    background: rgba(10,12,16,.55); padding: 8px 10px; border-radius: 12px; border:1px solid var(--ui-border);
+    display:flex; gap:10px; justify-content:space-between; align-items:center;
+  }
+  .hint { opacity: .75; }
+  .bigmsg {
+    position: fixed; inset: 0; display: grid; place-items: center; z-index: 20; pointer-events: none;
+    font: 800 64px/1.1 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color: #cfe8ff;
+    text-shadow: 0 0 30px #78d6ff55, 0 0 60px #78d6ff33;
+    opacity: 0; transition: opacity .4s ease;
+  }
+  .bigmsg.show { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <div class="word" id="word"><span class="typed"></span><span class="pending"></span></div>
+  <div class="chip" id="score">Score 0</div>
+  <div class="chip" id="combo">Combo x1</div>
+  <button class="btn" id="toggleLinks">Constellations: On</button>
+</div>
+
+<div class="footer">
+  <div class="bar" style="flex:1;"><div class="fill" id="timeFill"></div></div>
+  <div class="hint">Type the word. Space = Shockwave. K to toggle Kaleido. P to pause.</div>
+  <button class="btn" id="toggleKaleido">Kaleido: Off</button>
+</div>
+
+<div class="bigmsg" id="bigmsg">PAUSED</div>
+
+<script>
+(() => {
+  // ==== Canvas and core particle engine (based on the neon text particles) ====
+  const TWO_PI = Math.PI * 2;
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const off = document.createElement("canvas");
+  const offCtx = off.getContext("2d");
+
+  let W, H, CX, CY;
+  function resize() {
+    const { innerWidth: w, innerHeight: h } = window;
+    W = Math.floor(w * dpr);
+    H = Math.floor(h * dpr);
+    canvas.width = W; canvas.height = H;
+    canvas.style.width = w + "px"; canvas.style.height = h + "px";
+    CX = W / 2; CY = H / 2;
+    off.width = Math.max(2, Math.floor(W / 2));
+    off.height = Math.max(2, Math.floor(H / 2));
+    if (currentWord) renderTextToOffscreen(currentWord);
+    remapTargets();
+  }
+  window.addEventListener("resize", resize, { passive: true });
+
+  const pointer = { x: 0, y: 0, dx: 0, dy: 0, down: false, id: null };
+  function setPointer(e, x, y) {
+    const rect = canvas.getBoundingClientRect();
+    const px = (x - rect.left) * dpr;
+    const py = (y - rect.top) * dpr;
+    pointer.dx = px - pointer.x;
+    pointer.dy = py - pointer.y;
+    pointer.x = px; pointer.y = py;
+  }
+  canvas.addEventListener("pointerdown", e => { pointer.down = true; pointer.id = e.pointerId; setPointer(e, e.clientX, e.clientY); });
+  canvas.addEventListener("pointermove", e => { if (pointer.id === e.pointerId) setPointer(e, e.clientX, e.clientY); });
+  window.addEventListener("pointerup", e => { if (pointer.id === e.pointerId) { pointer.down = false; pointer.id = null; } });
+
+  // touch pinch warp
+  let lastDist = null;
+  canvas.addEventListener("touchmove", e => {
+    if (e.touches.length === 2) {
+      const t0 = e.touches[0], t1 = e.touches[1];
+      const dx = t0.clientX - t1.clientX;
+      const dy = t0.clientY - t1.clientY;
+      const dist = Math.hypot(dx, dy);
+      if (lastDist !== null) {
+        const scale = dist / Math.max(1, lastDist);
+        warp(scale);
+      }
+      lastDist = dist;
+    }
+  }, { passive: true });
+  canvas.addEventListener("touchend", () => { lastDist = null; }, { passive: true });
+
+  let kaleido = false;
+  let showLinks = true;
+
+  // UI elements
+  const wordEl = document.getElementById("word");
+  const scoreEl = document.getElementById("score");
+  const comboEl = document.getElementById("combo");
+  const timeFill = document.getElementById("timeFill");
+  const btnLinks = document.getElementById("toggleLinks");
+  const btnKaleido = document.getElementById("toggleKaleido");
+  const bigmsg = document.getElementById("bigmsg");
+
+  btnLinks.onclick = () => { showLinks = !showLinks; btnLinks.textContent = "Constellations: " + (showLinks ? "On" : "Off"); };
+  btnKaleido.onclick = () => { kaleido = !kaleido; btnKaleido.textContent = "Kaleido: " + (kaleido ? "On" : "Off"); };
+
+  // Particles
+  const particles = [];
+  let targetCount = 1600;
+
+  function makeParticle(x, y) {
+    const z = Math.random() ** 2;
+    return {
+      x, y, vx: 0, vy: 0,
+      tx: x, ty: y,
+      z,
+      hue: Math.random(),
+      life: Math.random() * 1000
+    };
+  }
+  function rebuildParticles() {
+    while (particles.length < targetCount) {
+      particles.push(makeParticle(
+        CX + (Math.random() - 0.5) * W * 0.6,
+        CY + (Math.random() - 0.5) * H * 0.6
+      ));
+    }
+    while (particles.length > targetCount) particles.pop();
+    remapTargets();
+  }
+
+  // Offscreen text sampling
+  let samplePoints = [];
+  function renderTextToOffscreen(str) {
+    const s = str.toString();
+    offCtx.clearRect(0, 0, off.width, off.height);
+
+    const maxW = off.width * 0.9;
+    const maxH = off.height * 0.6;
+    let fontSize = Math.min(maxH, maxW);
+    offCtx.textBaseline = "middle";
+    offCtx.textAlign = "center";
+
+    for (let f = fontSize; f > 6; f -= 2) {
+      offCtx.font = `800 ${f}px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial`;
+      const w = offCtx.measureText(s).width;
+      if (w <= maxW && f <= maxH) { fontSize = f; break; }
+    }
+    offCtx.font = `800 ${fontSize}px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial`;
+    offCtx.fillStyle = "#fff";
+    offCtx.fillText(s, off.width / 2, off.height / 2);
+
+    const img = offCtx.getImageData(0, 0, off.width, off.height).data;
+    const pts = [];
+    const step = Math.max(1, Math.floor(Math.min(off.width, off.height) / 140));
+    for (let y = 0; y < off.height; y += step) {
+      for (let x = 0; x < off.width; x += step) {
+        const i = (y * off.width + x) * 4 + 3;
+        if (img[i] > 128) {
+          const nx = (x / off.width - 0.5) * W + CX;
+          const ny = (y / off.height - 0.5) * H + CY;
+          pts.push({ x: nx, y: ny });
+        }
+      }
+    }
+    samplePoints = pts;
+  }
+  function remapTargets() {
+    if (!samplePoints.length) return;
+    for (let i = 0; i < particles.length; i++) {
+      const sp = samplePoints[(i * 997) % samplePoints.length];
+      particles[i].tx = sp.x; particles[i].ty = sp.y;
+    }
+  }
+
+  function burst(power = 1) {
+    for (const p of particles) {
+      const a = Math.random() * TWO_PI;
+      const m = (6 + Math.random() * 12) * power;
+      p.vx += Math.cos(a) * m;
+      p.vy += Math.sin(a) * m;
+    }
+  }
+  function warp(scale) {
+    for (const p of particles) {
+      const dx = p.x - CX, dy = p.y - CY;
+      p.x = CX + dx * scale;
+      p.y = CY + dy * scale;
+    }
+  }
+
+  // ==== Game state ====
+  const WORDS = [
+    "HELLO","BLAZE","QUICK","NOVA","RHYTHM","PIXEL","VORTEX","GLITCH","SPARK","CYBER",
+    "GALAXY","NEON","TYPHOON","ZEPHYR","KRAKEN","PHOTON","SHADOW","RAPTOR","VECTOR","ORBIT",
+    "CRYSTAL","EMBER","MATRIX","AURORA","PLASMA","STATIC","COMET","PHASE","ECHO","QUASAR",
+    "FUSION","BINARY","DYNAMIC","ZENITH","SWITCH","LASER","GAMBIT","REACT","PYTHON","FIREBASE",
+    "FORGE","KAKAPO","KERERU","AOTEAROA","WAIKATO","HAMILTON","MISSION","STREAK","CIPHER","BRIGHT"
+  ];
+
+  let currentWord = "";
+  let typed = "";
+  let wrongFlash = 0;
+
+  let score = 0;
+  let combo = 1;
+  let maxCombo = 1;
+  let timeLeft = 20; // seconds
+  let paused = false;
+  let gameOver = false;
+
+  function pickWord() {
+    const w = WORDS[Math.floor(Math.random() * WORDS.length)];
+    return w;
+  }
+
+  function setWord(w) {
+    currentWord = w;
+    typed = "";
+    renderTextToOffscreen(currentWord);
+    remapTargets();
+    renderWordHUD();
+  }
+
+  function renderWordHUD() {
+    const typedSpan = `<span class="typed">${escapeHTML(typed)}</span>`;
+    const pendingSpan = wrongFlash > 0
+      ? `<span class="wrong">${escapeHTML(currentWord.slice(typed.length))}</span>`
+      : `<span class="pending">${escapeHTML(currentWord.slice(typed.length))}</span>`;
+    wordEl.innerHTML = typedSpan + pendingSpan;
+    scoreEl.textContent = `Score ${score}`;
+    comboEl.textContent = `Combo x${combo}`;
+  }
+
+  function escapeHTML(s){ return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+  function addScore(base) {
+    const gained = Math.round(base * combo);
+    score += gained;
+    combo = Math.min(combo + 0.1, 10);
+    maxCombo = Math.max(maxCombo, combo);
+  }
+
+  function penalize() {
+    combo = 1;
+    timeLeft = Math.max(0, timeLeft - 1.5);
+    wrongFlash = 6; // frames
+    // kick particles slightly for feedback
+    for (let i = 0; i < 80; i++) {
+      const p = particles[(Math.random() * particles.length) | 0];
+      const a = Math.random() * TWO_PI;
+      const m = 10 + Math.random() * 14;
+      p.vx += Math.cos(a) * m;
+      p.vy += Math.sin(a) * m;
+    }
+  }
+
+  function nextWord() {
+    addScore(25 + 5 * currentWord.length);
+    timeLeft = Math.min(30, timeLeft + 2.5);
+    // ramp difficulty by adding particles slowly
+    targetCount = Math.min(4000, targetCount + 60);
+    rebuildParticles();
+    // celebratory burst
+    burst(1.4);
+    setWord(pickWord());
+  }
+
+  function showBig(text, ms = 800) {
+    bigmsg.textContent = text;
+    bigmsg.classList.add("show");
+    setTimeout(() => bigmsg.classList.remove("show"), ms);
+  }
+
+  function togglePause() {
+    if (gameOver) return;
+    paused = !paused;
+    showBig(paused ? "PAUSED" : "GO");
+  }
+
+  function endGame() {
+    gameOver = true;
+    paused = true;
+    showBig("GAME OVER", 1600);
+    setTimeout(() => {
+      alert(`Final score: ${score}\nMax combo: x${maxCombo.toFixed(1)}\nRefresh to try again`);
+    }, 600);
+  }
+
+  // ==== Input handling ====
+  window.addEventListener("keydown", (e) => {
+    if (gameOver) return;
+    if (e.key === "p" || e.key === "P") { togglePause(); return; }
+    if (paused) return;
+
+    if (e.key === " "){ // shockwave
+      e.preventDefault();
+      burst(2.0);
+      addScore(5);
+      renderWordHUD();
+      return;
+    }
+
+    const ch = e.key.length === 1 ? e.key.toUpperCase() : "";
+    if (!ch) return;
+
+    const want = currentWord.charAt(typed.length);
+    if (ch === want) {
+      typed += ch;
+      addScore(2);
+      // direct some particles outward from near the center for pop
+      for (let i = 0; i < 50; i++) {
+        const p = particles[(Math.random() * particles.length) | 0];
+        const dx = p.x - CX, dy = p.y - CY;
+        const a = Math.atan2(dy, dx) + (Math.random() - 0.5) * 0.6;
+        const m = 12 + Math.random() * 16;
+        p.vx += Math.cos(a) * m;
+        p.vy += Math.sin(a) * m;
+      }
+      if (typed.length === currentWord.length) nextWord();
+    } else {
+      penalize();
+    }
+    renderWordHUD();
+  });
+
+  // ==== Animation loop ====
+  let t = 0;
+  function loop() {
+    requestAnimationFrame(loop);
+    if (!paused) t += 1 / 60;
+
+    // countdown
+    if (!paused && !gameOver) {
+      timeLeft -= 1/60;
+      if (timeLeft <= 0) { timeLeft = 0; endGame(); }
+      timeFill.style.width = `${(timeLeft / 30) * 100}%`;
+    }
+
+    // mild idle pointer drift for motion when not pressing
+    if (!pointer.down && !paused) {
+      if ((t * 60) % 100 < 1) {
+        const angle = Math.random() * TWO_PI;
+        pointer.x = CX + Math.cos(angle) * (Math.min(W, H) * 0.18);
+        pointer.y = CY + Math.sin(angle) * (Math.min(W, H) * 0.18);
+      }
+    }
+
+    // fade background
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = paused ? "rgba(5,6,10,0.35)" : "rgba(5,6,10,0.25)";
+    ctx.fillRect(0, 0, W, H);
+
+    // physics
+    if (!paused) {
+      const mouseInfluence = pointer.down ? 25000 : 10000;
+      for (const p of particles) {
+        const dx = p.tx - p.x;
+        const dy = p.ty - p.y;
+        const spring = 0.010 + p.z * 0.018;
+        p.vx += dx * spring;
+        p.vy += dy * spring;
+
+        const mx = p.x - pointer.x;
+        const my = p.y - pointer.y;
+        const md2 = mx * mx + my * my + 0.001;
+        const repel = (mouseInfluence / md2) * (pointer.down ? 1.6 : 1.0);
+        p.vx += (mx / Math.sqrt(md2)) * repel * 0.02;
+        p.vy += (my / Math.sqrt(md2)) * repel * 0.02;
+
+        // gentle noise wobble with time
+        p.vx += Math.sin((p.life + t) * 0.6) * 0.04;
+        p.vy += Math.cos((p.life + t) * 0.5) * 0.04;
+
+        p.vx *= 0.92;
+        p.vy *= 0.92;
+
+        p.x += p.vx;
+        p.y += p.vy;
+
+        p.hue = (p.hue + 0.0015) % 1;
+        p.life += 0.016;
+      }
+    }
+
+    // draw glow
+    const glowStrength = 0.45;
+    const pulser = 1 + Math.sin(t * 2.0) * 0.35;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.filter = `blur(${Math.round(12 * glowStrength)}px) brightness(120%)`;
+    for (const p of particles) {
+      const s = (1.2 + p.z * 2.2) * pulser;
+      ctx.fillStyle = hsl(p.hue, 100, 60);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, s, 0, TWO_PI);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // crisp cores
+    for (const p of particles) {
+      const s = 0.7 + p.z * 1.2;
+      ctx.fillStyle = hsl(p.hue, 100, 70);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, s, 0, TWO_PI);
+      ctx.fill();
+    }
+
+    // constellation lines
+    if (showLinks) {
+      ctx.globalAlpha = 0.18;
+      ctx.strokeStyle = "#bfe7ff";
+      ctx.lineWidth = 1;
+      const stride = Math.max(1, Math.floor(particles.length / 900));
+      for (let i = 0; i < particles.length; i += stride) {
+        const a = particles[i];
+        for (let j = i + 1; j < i + 25 && j < particles.length; j += 3) {
+          const b = particles[j];
+          const dx = a.x - b.x, dy = a.y - b.y;
+          const d = Math.hypot(dx, dy);
+          if (d < 90) {
+            ctx.globalAlpha = 0.15 * (1 - d / 90);
+            ctx.beginPath();
+            ctx.moveTo(a.x, a.y);
+            ctx.lineTo(b.x, b.y);
+            ctx.stroke();
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // kaleidoscope remix
+    if (kaleido) {
+      const slice = Math.min(W, H) * 0.5;
+      ctx.save();
+      ctx.globalCompositeOperation = "screen";
+      for (let i = 0; i < 5; i++) {
+        ctx.translate(CX, CY);
+        ctx.rotate((i * TWO_PI) / 5 + t * 0.05);
+        ctx.translate(-CX, -CY);
+        ctx.drawImage(canvas, CX - slice, CY - slice, slice, slice,
+                              CX - slice, CY - slice, slice, slice);
+      }
+      ctx.restore();
+    }
+
+    if (wrongFlash > 0) wrongFlash--;
+  }
+
+  function hsl(h, s, l) { return `hsl(${(h * 360) | 0} ${s}% ${l}%)`; }
+
+  // ==== Boot ====
+  resize();
+  targetCount = 1800;
+  rebuildParticles();
+  setWord(pickWord());
+  showBig("3");
+  setTimeout(() => showBig("2"), 400);
+  setTimeout(() => showBig("1"), 800);
+  setTimeout(() => { showBig("GO"); }, 1200);
+  setTimeout(() => { paused = false; }, 1200);
+  // start paused for countdown
+  paused = true;
+  loop();
+
+})();
+</script>
+</body>
+</html>
